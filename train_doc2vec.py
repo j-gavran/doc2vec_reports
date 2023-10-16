@@ -25,10 +25,10 @@ def read_corpus(fname, tokens_only=False):
 def train(
     docs,
     vector_size=300,
-    window_size=20,
+    window_size=15,
     min_count=10,
     negative_size=5,
-    train_epoch=200,
+    train_epoch=150,
     dm=0,
     sample=1e-5,
     shrink_windows=False,
@@ -77,4 +77,4 @@ if __name__ == "__main__":
     for text in model_in:
         docs.append(for_d2v(text))
 
-    train(docs, saved_path="./model_reco_w20.bin")
+    train(docs, saved_path="./model_reco_w15.bin")

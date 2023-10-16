@@ -10,7 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
 
-def get_cos_sim(pdfs_lst, idx, model, lock, pos, degs=True):
+def get_cos_sim(pdfs_lst, idx, model, lock, pos, global_cache, degs=True):
     i_idx, j_idx = idx
     res_cos, idx_names = [], []
 
@@ -19,10 +19,27 @@ def get_cos_sim(pdfs_lst, idx, model, lock, pos, degs=True):
 
     for i, j in zip(i_idx, j_idx):
         name_i, text_i = pdfs_lst[0][i], pdfs_lst[1][i]
-        sim_i = model.infer_vector(text_i).reshape(1, -1)
-
         name_j, text_j = pdfs_lst[0][j], pdfs_lst[1][j]
-        sim_j = model.infer_vector(text_j).reshape(1, -1)
+
+        with lock:
+            infer_name_i = True if name_i not in global_cache else False
+            infer_name_j = True if name_j not in global_cache else False
+
+        if infer_name_i:
+            sim_i = model.infer_vector(text_i).reshape(1, -1)
+            with lock:
+                global_cache[name_i] = sim_i
+        else:
+            with lock:
+                sim_i = global_cache[name_i]
+
+        if infer_name_j:
+            sim_j = model.infer_vector(text_j).reshape(1, -1)
+            with lock:
+                global_cache[name_j] = sim_j
+        else:
+            with lock:
+                sim_j = global_cache[name_j]
 
         if degs:
             cos = np.degrees(np.arccos(cosine_similarity(sim_i, sim_j)[0][0]))
@@ -39,11 +56,15 @@ def get_cos_sim(pdfs_lst, idx, model, lock, pos, degs=True):
     return res_cos, idx_names
 
 
-def get_vectors(pdfs_dct, vec_size, model):
+def get_vectors(pdfs_dct, vec_size, model, global_cache):
     vec_mat = np.zeros((len(pdfs_dct), vec_size))
 
-    for i, text in tqdm(enumerate(pdfs_dct.values()), desc="Getting doc2vec vectors"):
-        vec_mat[i, :] = model.infer_vector(text).reshape(1, -1)
+    for i, name in tqdm(enumerate(pdfs_dct.keys())):
+        if name not in global_cache:
+            global_cache[name] = model.infer_vector(pdfs_dct[name]).reshape(1, -1)
+            vec_mat[i, :] = global_cache[name]
+        else:
+            vec_mat[i, :] = global_cache[name]
 
     return vec_mat
 
@@ -56,13 +77,25 @@ def cos_sim_worker(pdfs_dct, model, workers=1, **kwargs):
 
     m = multiprocessing.Manager()
     lock = m.Lock()
+    global_cache = m.dict()
 
     pdfs_lst = [list(pdfs_dct.keys()), list(pdfs_dct.values())]
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = []
         for i, (i_split, j_split) in enumerate(zip(i_idx_split, j_idx_split)):
-            futures.append(executor.submit(get_cos_sim, pdfs_lst, [i_split, j_split], model, lock, i + 1, **kwargs))
+            futures.append(
+                executor.submit(
+                    get_cos_sim,
+                    pdfs_lst,
+                    [i_split, j_split],
+                    model,
+                    lock,
+                    i + 1,
+                    global_cache,
+                    **kwargs,
+                )
+            )
 
     results = []
     for future in futures:
@@ -81,7 +114,7 @@ def cos_sim_worker(pdfs_dct, model, workers=1, **kwargs):
             cos_vals.append(cos[k])
             name_pairs.append((name_i, name_j))
 
-    return cos_mat.T, [cos_vals, name_pairs]
+    return cos_mat.T, [cos_vals, name_pairs], global_cache
 
 
 def censor_name(full_name):
@@ -92,7 +125,7 @@ def censor_name(full_name):
     return censor_name
 
 
-def plot_cos_corr_matrix(pdfs_dct, res_cos, save=False, scale=90, annot=False, censor=False, **kwargs):
+def plot_cos_corr_matrix(pdfs_dct, res_cos, save=False, scale=90, annot=False, censor=False, minmax=False, **kwargs):
     plt.figure(figsize=(12, 10))
 
     if annot:
@@ -106,6 +139,12 @@ def plot_cos_corr_matrix(pdfs_dct, res_cos, save=False, scale=90, annot=False, c
     else:
         xticklabels = list(pdfs_dct.keys())
         yticklabels = list(pdfs_dct.keys())
+
+    if minmax:
+        mask = np.zeros(res_cos.shape, dtype=bool)
+        nan_idx = np.tril_indices(len(pdfs_dct), k=-1)
+        mask[nan_idx] = True
+        res_cos = (res_cos - np.min(res_cos[mask])) / (np.max(res_cos[mask]) - np.min(res_cos[mask]))
 
     sns.heatmap(
         1 - res_cos / scale if scale is not None else res_cos,
@@ -136,7 +175,9 @@ def plot_cos_scores(cos_vals, name_pairs, top=-1, reverse=True, thres=None, save
         print(f"{name_pairs[idx]}: {cos_vals[idx]:.3f}")
 
     if censor:
-        labels = np.array([f"{censor_name(name_i)} - {censor_name(name_j)}" for name_i, name_j in name_pairs], dtype=object)
+        labels = np.array(
+            [f"{censor_name(name_i)} - {censor_name(name_j)}" for name_i, name_j in name_pairs], dtype=object
+        )
     else:
         labels = np.array([f"{name_i} - {name_j}" for name_i, name_j in name_pairs], dtype=object)
 
@@ -201,16 +242,16 @@ if __name__ == "__main__":
         path="reports/",
         ignore=None,
         engine="textract",
-        skip=500,
+        skip=700,
     )
 
     model = g.Doc2Vec.load("model_reco.bin")  # doc2vec model
 
     censor = True
 
-    res_cos, scores = cos_sim_worker(pdfs_dct, model, workers=10, degs=False)
+    res_cos, scores, cache = cos_sim_worker(pdfs_dct, model, workers=4, degs=False)
     plot_cos_corr_matrix(pdfs_dct, res_cos, scale=None, censor=censor, save="cos_sim.png")
     plot_cos_scores(*scores, top=50, thres=0.65, censor=censor, save="cos_sim_scores.png")
 
-    res_vec = get_vectors(pdfs_dct, vec_size, model)
+    res_vec = get_vectors(pdfs_dct, vec_size, model, cache)
     get_2d_pca(pdfs_dct, res_vec, censor=censor, save="pca.png")
